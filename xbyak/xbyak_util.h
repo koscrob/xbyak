@@ -142,7 +142,7 @@ private:
 
 	static const uint32_t maxNumberCacheLevels = 10;
 	uint32_t dataCacheSize_[maxNumberCacheLevels];
-	uint32_t coresSharignDataCache_[maxNumberCacheLevels];
+	uint32_t coresSharingDataCache_[maxNumberCacheLevels];
 	uint32_t dataCacheLevels_;
 	uint32_t avx10version_;
 
@@ -253,7 +253,7 @@ private:
 				if (logical_cores != 0) {
 					actual_logical_cores = local::min_(actual_logical_cores, logical_cores);
 				}
-				coresSharignDataCache_[cache_index] = local::max_(actual_logical_cores / smt_width, 1);
+				coresSharingDataCache_[cache_index] = local::max_(actual_logical_cores / smt_width, 1);
 				++cache_index;
 			}
 			return;
@@ -298,7 +298,7 @@ private:
 					* (data[2] + 1);
 				if (cacheType == DATA_CACHE && smt_width == 0) smt_width = actual_logical_cores;
 				assert(smt_width != 0);
-				coresSharignDataCache_[dataCacheLevels_] = local::max_(actual_logical_cores / smt_width, 1u);
+				coresSharingDataCache_[dataCacheLevels_] = local::max_(actual_logical_cores / smt_width, 1u);
 				dataCacheLevels_++;
 			}
 		}
@@ -326,7 +326,7 @@ public:
 	uint32_t getCoresSharingDataCache(uint32_t i) const
 	{
 		if (i >= dataCacheLevels_) XBYAK_THROW_RET(ERR_BAD_PARAMETER, 0)
-		return coresSharignDataCache_[i];
+		return coresSharingDataCache_[i];
 	}
 	uint32_t getDataCacheSize(uint32_t i) const
 	{
@@ -488,7 +488,7 @@ public:
 		, x2APIC_supported_(false)
 		, numCores_()
 		, dataCacheSize_()
-		, coresSharignDataCache_()
+		, coresSharingDataCache_()
 		, dataCacheLevels_(0)
 		, avx10version_(0)
 	{
