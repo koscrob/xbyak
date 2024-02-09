@@ -186,7 +186,7 @@ private:
 		uint32_t data[4] = {};
 		getCpuid(0x0, data);
 		if (data[0] >= 0xB) {
-			 /*
+			/*
 				if leaf 11 exists(x2APIC is supported),
 				we use it to get the number of smt cores and cores on socket
 
@@ -207,29 +207,34 @@ private:
 			numCores_[CoreLevel - 1] = local::max_(numCores_[SmtLevel - 1], numCores_[CoreLevel - 1]);
 		} else {
 			getCpuid(0x80000000, data);
-			if ((data[0] >= 0x80000008) && has(tAMD)) {
+			if (has(tAMD) && (data[0] >= 0x80000008)) {
 				/*
-					Extended Method (Recommended)
+					AMD - Extended Method (Recommended)
 				*/
-				getCpuid(0x1, data);
-				uint32_t LogicalProcessorCount = extractBit(data[1], 16, 23); // Logical processor count.
-				uint32_t HTT = extractBit(data[3], 28, 28); // Hyper-threading technology.
-				getCpuid(0x80000001, data);
-				uint32_t CmpLegacy = extractBit(data[2], 1, 1); // Core multi-processing legacy mode.
 				getCpuid(0x80000008, data);
-				uint32_t NC = extractBit(data[2], 0, 7);
-
-
-
 				numCores_[SmtLevel - 1] = 1;
 				numCores_[CoreLevel - 1] = extractBit(data[2], 0, 7) + 1;
+			} else if (has(tAMD)) {
+				/*
+					AMD - Legacy Method
+				*/
+				getCpuid(0x1, data);
+				uint32_t logical_processor_count = extractBit(data[1], 16, 23);
+				uint32_t htt = extractBit(data[3], 28, 28); // Hyper-threading technology.
+				if (htt == 0) {
+					numCores_[SmtLevel - 1] = 1;
+					numCores_[CoreLevel - 1] = 1;
+				} else {
+					numCores_[SmtLevel - 1] = 1;
+					numCores_[CoreLevel - 1] = logical_processor_count;
+				}
 			} else {
 				/*
-					Failed to deremine num of cores without x2APIC support.
-					TODO: USE initial APIC ID to determine ncores.
+					Intel - Legacy Method
 				*/
-				numCores_[SmtLevel - 1] = 0;
-				numCores_[CoreLevel - 1] = 0;
+				getCpuidEx(0x4, 0, data);
+				numCores_[SmtLevel - 1] = 1;
+				numCores_[CoreLevel - 1] = extractBit(data[0], 26, 31);
 			}
 			
 		}
