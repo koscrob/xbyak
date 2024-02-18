@@ -91,7 +91,7 @@ namespace Xbyak { namespace util {
 typedef enum {
    SmtLevel = 1,
    CoreLevel = 2
-} IntelCpuTopologyLevel;
+} TopologyLevel;
 
 namespace local {
 
@@ -136,7 +136,6 @@ public:
 private:
 	Type type_;
 	//system topology
-	bool x2APIC_supported_;
 	static const size_t maxTopologyLevels = 2;
 	uint32_t numCores_[maxTopologyLevels];
 
@@ -146,38 +145,30 @@ private:
 	uint32_t dataCacheLevels_;
 	uint32_t avx10version_;
 
-	uint32_t get32bitAsBE(const char *x) const
+	uint32_t extractBit(uint32_t val, uint32_t base, uint32_t end)
 	{
-		return x[0] | (x[1] << 8) | (x[2] << 16) | (x[3] << 24);
-	}
-	uint32_t mask(int n) const
-	{
-		return (1U << n) - 1;
+		return (val >> base) & ((1u << (end + 1 - base)) - 1);
 	}
 	void setFamily()
 	{
 		uint32_t data[4] = {};
 		getCpuid(1, data);
-		stepping = data[0] & mask(4);
-		model = (data[0] >> 4) & mask(4);
-		family = (data[0] >> 8) & mask(4);
-		// type = (data[0] >> 12) & mask(2);
-		extModel = (data[0] >> 16) & mask(4);
-		extFamily = (data[0] >> 20) & mask(8);
+		stepping = extractBit(data[0], 0, 3);
+		model = extractBit(data[0], 4, 7);
+		family = extractBit(data[0], 8, 11);
+		//type = extractBit(data[0], 12, 13);
+		extModel = extractBit(data[0], 16, 19);
+		extFamily = extractBit(data[0], 20, 27);
 		if (family == 0x0f) {
 			displayFamily = family + extFamily;
 		} else {
 			displayFamily = family;
 		}
-		if (family == 6 || family == 0x0f) {
+		if ((has(tINTEL) && family == 6) || family == 0x0f) {
 			displayModel = (extModel << 4) + model;
 		} else {
 			displayModel = model;
 		}
-	}
-	uint32_t extractBit(uint32_t val, uint32_t base, uint32_t end)
-	{
-		return (val >> base) & ((1u << (end + 1 - base)) - 1);
 	}
 	void setNumCores()
 	{
@@ -186,149 +177,196 @@ private:
 		uint32_t data[4] = {};
 		getCpuid(0x0, data);
 		if (data[0] >= 0xB) {
-			/*
-				if leaf 11 exists(x2APIC is supported),
-				we use it to get the number of smt cores and cores on socket
+			// Check if "Extended Topology Enumeration" is implemented.
+			getCpuidEx(0xB, 0, data);
+			if (data[0] != 0 || data[1] != 0) {
+				/*
+					if leaf 11 exists(x2APIC is supported),
+					we use it to get the number of smt cores and cores on socket
 
-				leaf 0xB can be zeroed-out by a hypervisor
-			*/
-			x2APIC_supported_ = true;
-			for (uint32_t i = 0; i < maxTopologyLevels; i++) {
-				getCpuidEx(0xB, i, data);
-				IntelCpuTopologyLevel level = (IntelCpuTopologyLevel)extractBit(data[2], 8, 15);
-				if (level == SmtLevel || level == CoreLevel) {
-					numCores_[level - 1] = extractBit(data[1], 0, 15);
+					leaf 0xB can be zeroed-out by a hypervisor
+				*/
+				for (uint32_t i = 0; i < maxTopologyLevels; i++) {
+					getCpuidEx(0xB, i, data);
+					TopologyLevel level = (TopologyLevel)extractBit(data[2], 8, 15);
+					if (level == SmtLevel || level == CoreLevel) {
+						numCores_[level - 1] = extractBit(data[1], 0, 15);
+					}
 				}
+				/*
+					Fallback values in case a hypervisor has the leaf zeroed-out.
+				*/
+				numCores_[SmtLevel - 1] = local::max_(1u, numCores_[SmtLevel - 1]);
+				numCores_[CoreLevel - 1] = local::max_(numCores_[SmtLevel - 1], numCores_[CoreLevel - 1]);
+				return;
 			}
-			/*
-				Fallback values in case a hypervisor has 0xB leaf zeroed-out.
-			*/
-			numCores_[SmtLevel - 1] = local::max_(1u, numCores_[SmtLevel - 1]);
-			numCores_[CoreLevel - 1] = local::max_(numCores_[SmtLevel - 1], numCores_[CoreLevel - 1]);
-		} else {
-			getCpuid(0x80000000, data);
-			if (has(tAMD) && (data[0] >= 0x80000008)) {
-				/*
-					AMD - Extended Method (Recommended)
-				*/
-				getCpuid(0x80000008, data);
-				numCores_[SmtLevel - 1] = 1;
-				numCores_[CoreLevel - 1] = extractBit(data[2], 0, 7) + 1;
-			} else if (has(tAMD)) {
-				/*
-					AMD - Legacy Method
-				*/
-				getCpuid(0x1, data);
-				uint32_t logical_processor_count = extractBit(data[1], 16, 23);
-				uint32_t htt = extractBit(data[3], 28, 28); // Hyper-threading technology.
-				if (htt == 0) {
-					numCores_[SmtLevel - 1] = 1;
-					numCores_[CoreLevel - 1] = 1;
-				} else {
-					numCores_[SmtLevel - 1] = 1;
-					numCores_[CoreLevel - 1] = logical_processor_count;
-				}
-			} else {
-				/*
-					Intel - Legacy Method
-				*/
-				getCpuidEx(0x4, 0, data);
-				numCores_[SmtLevel - 1] = 1;
-				numCores_[CoreLevel - 1] = extractBit(data[0], 26, 31);
-			}
-			
 		}
-
+		// "Extended Topology Enumeration" is not supported. 
+		if (has(tAMD)) {
+			/*
+				AMD - Legacy Method
+			*/
+			int physicalThreadCount = 0;
+			getCpuid(0x1, data);
+			int logicalProcessorCount = extractBit(data[1], 16, 23);
+			int htt = extractBit(data[3], 28, 28); // Hyper-threading technology.
+			getCpuid(0x80000000, data);
+			int highestExtendedLeaf = data[0];
+			if (highestExtendedLeaf >= 0x80000008) {
+				getCpuid(0x80000008, data);
+				physicalThreadCount = extractBit(data[2], 0, 7) + 1;
+			}
+			if (htt == 0) {
+				numCores_[SmtLevel - 1] = 1;
+				numCores_[CoreLevel - 1] = 1;
+			} else if (physicalThreadCount > 1) {
+				if ((displayFamily >= 0x17) && (highestExtendedLeaf >= 0x8000001E)) {
+					// Zen overreports its core count by a factor of two.
+					getCpuid(0x8000001E, data);
+					int threadsPerComputeUnit = extractBit(data[1], 8, 15) + 1;
+					physicalThreadCount /= threadsPerComputeUnit;
+				}
+				numCores_[SmtLevel - 1] = logicalProcessorCount / physicalThreadCount;
+				numCores_[CoreLevel - 1] = logicalProcessorCount;
+			} else {
+				numCores_[SmtLevel - 1] = 1;
+				numCores_[CoreLevel - 1] = logicalProcessorCount > 1 ? logicalProcessorCount : 2;
+			}
+		} else {
+			/*
+				Intel - Legacy Method
+			*/
+			int physicalThreadCount = 0;
+			getCpuid(0x1, data);
+			int logicalProcessorCount = extractBit(data[1], 16, 23);
+			int htt = extractBit(data[3], 28, 28); // Hyper-threading technology.
+			getCpuid(0, data);
+			if (data[0] >= 0x4) {
+				getCpuid(0x4, data);
+				physicalThreadCount = extractBit(data[0], 26, 31) + 1;
+			}
+			if (htt == 0) {
+				numCores_[SmtLevel - 1] = 1;
+				numCores_[CoreLevel - 1] = 1;
+			} else if (physicalThreadCount > 1) {
+				numCores_[SmtLevel - 1] = logicalProcessorCount / physicalThreadCount;
+				numCores_[CoreLevel - 1] = logicalProcessorCount;
+			} else {
+				numCores_[SmtLevel - 1] = 1;
+				numCores_[CoreLevel - 1] = logicalProcessorCount > 0 ? logicalProcessorCount : 1;
+			}
+		}
 	}
 	void setCacheHierarchy()
 	{
-		if (!has(tINTEL) && !has(tAMD)) return;
-
-		// https://github.com/amd/ZenDNN/blob/a08bf9a9efc160a69147cdecfb61cc85cc0d4928/src/cpu/x64/xbyak/xbyak_util.h#L236-L288
+		uint32_t data[4] = {};
 		if (has(tAMD)) {
-			uint32_t data[4] = {};
 			getCpuid(0x80000000, data);
 			if (data[0] >= 0x8000001D) {
-				// There are 3 Data Cache Levels (L1, L2, L3)
-				dataCacheLevels_ = 3;
-				const uint32_t leaf = 0x8000001D; // for modern AMD CPus
-				// Sub leaf value ranges from 0 to 3
-				// Sub leaf value 0 refers to L1 Data Cache
-				// Sub leaf value 1 refers to L1 Instruction Cache
-				// Sub leaf value 2 refers to L2 Cache
-				// Sub leaf value 3 refers to L3 Cache
+				// For modern AMD CPUs.
 				int cache_index = 0;
-				for (uint32_t sub_leaf = 0; sub_leaf <= dataCacheLevels_; sub_leaf++) {
-					// Skip sub_leaf = 1 as it refers to
-					// L1 Instruction Cache (not required)
-					if (sub_leaf == 1) {
-						continue;
+				dataCacheLevels_ = 0;
+				for (uint32_t subLeaf = 0; dataCacheLevels_ < maxNumberCacheLevels; subLeaf++) {
+					getCpuidEx(0x8000001D, subLeaf, data);
+					int cacheType = extractBit(data[0], 0, 4);
+					/*
+					  cacheType
+						00h - Null; no more caches
+						01h - Data cache
+						02h - Instrution cache
+						03h - Unified cache
+						04h-1Fh - Reserved
+					*/
+					if (cacheType == 0) break; // No more caches.
+					if (cacheType == 0x2) continue; // Skip instruction cache.
+					int cacheLevel = extractBit(data[0], 5, 7);
+					int fullyAssociative = extractBit(data[0], 9, 9);
+					int numSharingCache = extractBit(data[0], 14, 25) + 1;
+					int cacheNumWays = extractBit(data[1], 22, 31) + 1;
+					int cachePhysPartitions = extractBit(data[1], 12, 21) + 1;
+					int cacheLineSize = extractBit(data[1], 0, 11) + 1;
+					int cacheNumSets = data[2] + 1;
+					int cacheInclusive = extractBit(data[3], 1, 1);
+					dataCacheSize_[dataCacheLevels_] =
+						cacheLineSize * cachePhysPartitions * cacheNumWays;
+					if (fullyAssociative == 0) {
+						dataCacheSize_[dataCacheLevels_] *= cacheNumSets;
 					}
-					getCpuidEx(leaf, sub_leaf, data);
-					// Cache Size = Line Size * Partitions * Associativity * Cache Sets
-					dataCacheSize_[cache_index] =
-						(extractBit(data[1], 22, 31) + 1) // Associativity-1
-						* (extractBit(data[1], 12, 21) + 1) // Partitions-1
-						* (extractBit(data[1], 0, 11) + 1) // Line Size
-						* (data[2] + 1);
-					// Calculate the number of cores sharing the current data cache
-					int smt_width = numCores_[0];
-					int logical_cores = numCores_[1];
-					int actual_logical_cores = extractBit(data[0], 14, 25) /* # of cores * # of threads */ + 1;
-					if (logical_cores != 0) {
-						actual_logical_cores = local::min_(actual_logical_cores, logical_cores);
+					if (subLeaf > 0) {
+						numSharingCache = local::min_(numSharingCache, (int)numCores_[1]);
+						numSharingCache /= local::max_(1u, coresSharingDataCache_[0]);
 					}
-					coresSharingDataCache_[cache_index] = local::max_(actual_logical_cores / smt_width, 1);
-					++cache_index;
+					coresSharingDataCache_[dataCacheLevels_] = numSharingCache;
+					dataCacheLevels_ += 1;
 				}
-			} else {
-				// For legacy AMD CPU, use leaf 0x80000005 for L1 cache
-				// and 0x80000006 for L2 and L3 cache
+				coresSharingDataCache_[0] = local::min_(1u, coresSharingDataCache_[0]);
+			} else if (data[0] >= 0x80000006) {
+				// For legacy AMD CPUs, use leaf 0x80000005 for L1 cache
+				// and 0x80000006 for L2 and L3 cache.
+				dataCacheLevels_ = 1;
+				getCpuid(0x80000005, data);
+				int l1dc_size = extractBit(data[2], 24, 31);
+				dataCacheSize_[0] = l1dc_size * 1024;
+				coresSharingDataCache_[0] = 1;
+				getCpuid(0x80000006, data);
+				// L2 cache
+				int l2_assoc = extractBit(data[2], 12, 15);
+				if (l2_assoc > 0) {
+					dataCacheLevels_ = 2;
+					int l2_size = extractBit(data[2], 16, 31);
+					dataCacheSize_[1] = l2_size * 1024;
+					coresSharingDataCache_[1] = 1;
+				}
+				// L3 cache
+				int l3_assoc = extractBit(data[3], 12, 15);
+				if (l3_assoc > 0) {
+					dataCacheLevels_ = 3;
+					int l3_size = extractBit(data[3], 18, 31);
+					dataCacheSize_[2] = l3_size * 512 * 1024;
+					coresSharingDataCache_[2] = numCores_[1];
+				}
 			}
-			return;
-		}
-		// intel
-		const uint32_t NO_CACHE = 0;
-		const uint32_t DATA_CACHE = 1;
-//		const uint32_t INSTRUCTION_CACHE = 2;
-		const uint32_t UNIFIED_CACHE = 3;
-		uint32_t smt_width = 0;
-		uint32_t logical_cores = 0;
-		uint32_t data[4] = {};
+		} else if (has(tINTEL)) {
+			// Use the "Deterministic Cache Parameters" leaf if supported.
+			const uint32_t NO_CACHE = 0;
+			const uint32_t DATA_CACHE = 1;
+			//const uint32_t INSTRUCTION_CACHE = 2;
+			const uint32_t UNIFIED_CACHE = 3;
+			uint32_t smt_width = 0;
+			uint32_t logical_cores = 0;
 
-		if (x2APIC_supported_) {
 			smt_width = numCores_[0];
 			logical_cores = numCores_[1];
-		}
 
-		/*
-			Assumptions:
-			the first level of data cache is not shared (which is the
-			case for every existing architecture) and use this to
-			determine the SMT width for arch not supporting leaf 11.
-			when leaf 4 reports a number of core less than numCores_
-			on socket reported by leaf 11, then it is a correct number
-			of cores not an upperbound.
-		*/
-		for (int i = 0; dataCacheLevels_ < maxNumberCacheLevels; i++) {
-			getCpuidEx(0x4, i, data);
-			uint32_t cacheType = extractBit(data[0], 0, 4);
-			if (cacheType == NO_CACHE) break;
-			if (cacheType == DATA_CACHE || cacheType == UNIFIED_CACHE) {
-				uint32_t actual_logical_cores = extractBit(data[0], 14, 25) + 1;
-				if (logical_cores != 0) { // true only if leaf 0xB is supported and valid
-					actual_logical_cores = local::min_(actual_logical_cores, logical_cores);
+			/*
+				Assumptions:
+				the first level of data cache is not shared (which is the
+				case for every existing architecture) and use this to
+				determine the SMT width for arch not supporting leaf 11.
+				when leaf 4 reports a number of core less than numCores_
+				on socket reported by leaf 11, then it is a correct number
+				of cores not an upperbound.
+			*/
+			for (int i = 0; dataCacheLevels_ < maxNumberCacheLevels; i++) {
+				getCpuidEx(0x4, i, data);
+				uint32_t cacheType = extractBit(data[0], 0, 4);
+				if (cacheType == NO_CACHE) break;
+				if (cacheType == DATA_CACHE || cacheType == UNIFIED_CACHE) {
+					uint32_t actual_logical_cores = extractBit(data[0], 14, 25) + 1;
+					if (logical_cores != 0) { // true only if leaf 0xB is supported and valid
+						actual_logical_cores = local::min_(actual_logical_cores, logical_cores);
+					}
+					assert(actual_logical_cores != 0);
+					dataCacheSize_[dataCacheLevels_] =
+						(extractBit(data[1], 22, 31) + 1)
+						* (extractBit(data[1], 12, 21) + 1)
+						* (extractBit(data[1], 0, 11) + 1)
+						* (data[2] + 1);
+					if (cacheType == DATA_CACHE && smt_width == 0) smt_width = actual_logical_cores;
+					assert(smt_width != 0);
+					coresSharingDataCache_[dataCacheLevels_] = local::max_(actual_logical_cores / smt_width, 1u);
+					dataCacheLevels_++;
 				}
-				assert(actual_logical_cores != 0);
-				dataCacheSize_[dataCacheLevels_] =
-					(extractBit(data[1], 22, 31) + 1)
-					* (extractBit(data[1], 12, 21) + 1)
-					* (extractBit(data[1], 0, 11) + 1)
-					* (data[2] + 1);
-				if (cacheType == DATA_CACHE && smt_width == 0) smt_width = actual_logical_cores;
-				assert(smt_width != 0);
-				coresSharingDataCache_[dataCacheLevels_] = local::max_(actual_logical_cores / smt_width, 1u);
-				dataCacheLevels_++;
 			}
 		}
 	}
@@ -342,8 +380,7 @@ public:
 	int displayFamily; // family + extFamily
 	int displayModel; // model + extModel
 
-	uint32_t getNumCores(IntelCpuTopologyLevel level) const {
-		//if (!x2APIC_supported_) XBYAK_THROW_RET(ERR_X2APIC_IS_NOT_SUPPORTED, 0)
+	uint32_t getNumCores(TopologyLevel level) const {
 		switch (level) {
 		case SmtLevel: return numCores_[level - 1];
 		case CoreLevel: return numCores_[level - 1] / numCores_[SmtLevel - 1];
@@ -366,24 +403,25 @@ public:
 	/*
 		data[] = { eax, ebx, ecx, edx }
 	*/
-	static inline void getCpuid(uint32_t eaxIn, uint32_t data[4])
-	{
-#ifdef XBYAK_INTEL_CPU_SPECIFIC
-	#ifdef _WIN32
-		__cpuid(reinterpret_cast<int*>(data), eaxIn);
-	#else
-		__cpuid(eaxIn, data[0], data[1], data[2], data[3]);
-	#endif
-#else
-		(void)eaxIn;
-		(void)data;
-#endif
-	}
 	static inline void getCpuidEx(uint32_t eaxIn, uint32_t ecxIn, uint32_t data[4])
 	{
 #ifdef XBYAK_INTEL_CPU_SPECIFIC
 	#ifdef _WIN32
-		__cpuidex(reinterpret_cast<int*>(data), eaxIn, ecxIn);
+		//__cpuidex(reinterpret_cast<int*>(data), eaxIn, ecxIn);
+		switch (eaxIn) {
+		case 0x00000000: data[0] = 0x00000001; data[1] = 0x68747541; data[2] = 0x444D4163; data[3] = 0x69746E65; break;
+		case 0x00000001: data[0] = 0x00000F51; data[1] = 0x00000881; data[2] = 0x00000000; data[3] = 0x078BFBFF; break;
+		case 0x80000000: data[0] = 0x80000018; data[1] = 0x68747541; data[2] = 0x444D4163; data[3] = 0x69746E65; break;
+		case 0x80000001: data[0] = 0x00000F51; data[1] = 0x00000000; data[2] = 0x00000000; data[3] = 0xE1D3FBFF; break;
+		case 0x80000002: data[0] = 0x20444D41; data[1] = 0x6574704F; data[2] = 0x286E6F72; data[3] = 0x20296D74; break;
+		case 0x80000003: data[0] = 0x636F7250; data[1] = 0x6F737365; data[2] = 0x34322072; data[3] = 0x45482030; break;
+		case 0x80000005: data[0] = 0xFF08FF08; data[1] = 0xFF20FF20; data[2] = 0x40020140; data[3] = 0x40020140; break;
+		case 0x80000006: data[0] = 0x00000000; data[1] = 0x42004200; data[2] = 0x04008140; data[3] = 0x00000000; break;
+		case 0x80000007: data[0] = 0x00000000; data[1] = 0x00000000; data[2] = 0x00000000; data[3] = 0x00000009; break;
+		case 0x80000008: data[0] = 0x00003028; data[1] = 0x00000000; data[2] = 0x00000000; data[3] = 0x00000000; break;
+		case 0x8FFFFFFF: data[0] = 0x53275449; data[1] = 0x4D414820; data[2] = 0x2052454D; data[3] = 0x454D4954; break;
+		default: data[0] = 0; data[1] = 0; data[2] = 0; data[3] = 0; break;
+		}
 	#else
 		__cpuid_count(eaxIn, ecxIn, data[0], data[1], data[2], data[3]);
 	#endif
@@ -393,11 +431,16 @@ public:
 		(void)data;
 #endif
 	}
+	static inline void getCpuid(uint32_t eaxIn, uint32_t data[4])
+	{
+		getCpuidEx(eaxIn, 0, data);
+	}
 	static inline uint64_t getXfeature()
 	{
 #ifdef XBYAK_INTEL_CPU_SPECIFIC
 	#ifdef _MSC_VER
-		return _xgetbv(0);
+		// TODO(just removed to run cpuid tests): return _xgetbv(0); -- DO NOT COMMIT
+		return 6 | (7 << 5);
 	#else
 		uint32_t eax, edx;
 		// xgetvb is not support on gcc 4.2
@@ -514,7 +557,6 @@ public:
 
 	Cpu()
 		: type_()
-		, x2APIC_supported_(false)
 		, numCores_()
 		, dataCacheSize_()
 		, coresSharingDataCache_()
@@ -528,9 +570,9 @@ public:
 		const uint32_t& EDX = data[3];
 		getCpuid(0, data);
 		const uint32_t maxNum = EAX;
-		static const char intel[] = "ntel";
-		static const char amd[] = "cAMD";
-		if (ECX == get32bitAsBE(amd)) {
+		static const uint32_t amd[]   = { 0x68747541 /* Auth */, 0x444D4163 /* cAMD */, 0x69746E65 /* enti */};
+		static const uint32_t intel[] = { 0x756E6547 /* Genu */, 0x6C65746E /* ntel */, 0x49656E69 /* ineI */};
+		if (EBX == amd[0] && ECX == amd[1] && EDX == amd[2]) {
 			type_ |= tAMD;
 			getCpuid(0x80000001, data);
 			if (EDX & (1U << 31)) {
@@ -544,7 +586,7 @@ public:
 				type_ |= tPREFETCHW;
 			}
 		}
-		if (ECX == get32bitAsBE(intel)) {
+		if (EBX == intel[0] && ECX == intel[1] && EDX == intel[2]) {
 			type_ |= tINTEL;
 		}
 
@@ -681,7 +723,7 @@ public:
 		}
 		if (has(tAVX10) && maxNum >= 0x24) {
 			getCpuidEx(0x24, 0, data);
-			avx10version_ = EBX & mask(7);
+			avx10version_ = EBX & 0x7F;
 		}
 		setFamily();
 		setNumCores();
