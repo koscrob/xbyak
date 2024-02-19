@@ -91,7 +91,7 @@ namespace Xbyak { namespace util {
 typedef enum {
    SmtLevel = 1,
    CoreLevel = 2
-} TopologyLevel;
+} CpuTopologyLevel;
 
 namespace local {
 
@@ -188,7 +188,7 @@ private:
 				*/
 				for (uint32_t i = 0; i < maxTopologyLevels; i++) {
 					getCpuidEx(0xB, i, data);
-					TopologyLevel level = (TopologyLevel)extractBit(data[2], 8, 15);
+					CpuTopologyLevel level = (CpuTopologyLevel)extractBit(data[2], 8, 15);
 					if (level == SmtLevel || level == CoreLevel) {
 						numCores_[level - 1] = extractBit(data[1], 0, 15);
 					}
@@ -327,7 +327,7 @@ private:
 				}
 			}
 		} else if (has(tINTEL)) {
-			// Use the "Deterministic Cache Parameters" leaf if supported.
+			// Use the "Deterministic Cache Parameters" leaf is supported.
 			const uint32_t NO_CACHE = 0;
 			const uint32_t DATA_CACHE = 1;
 			//const uint32_t INSTRUCTION_CACHE = 2;
@@ -380,7 +380,7 @@ public:
 	int displayFamily; // family + extFamily
 	int displayModel; // model + extModel
 
-	uint32_t getNumCores(TopologyLevel level) const {
+	uint32_t getNumCores(CpuTopologyLevel level) const {
 		switch (level) {
 		case SmtLevel: return numCores_[level - 1];
 		case CoreLevel: return numCores_[level - 1] / numCores_[SmtLevel - 1];
